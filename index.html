@@ -125,6 +125,13 @@ async function saveProject(form){let data=new FormData(form),old=settings.projec
 async function commitModal(next){if(busy)return;busy=true;document.querySelectorAll('.modal button').forEach(b=>b.disabled=true);try{await saveSettings(next);busy=false;closeModal();toast(t('saved'))}catch(e){busy=false;document.querySelectorAll('.modal button').forEach(b=>b.disabled=false);let el=$('#edit-error');if(el)el.textContent=errorMessage(e);else toast(errorMessage(e))}}
 function confirmChange(kind,id){if(structureLocked()){toast(t('locked'));return}if(kind==='questions'&&['role','project'].includes(settings.questions.find(q=>q.id===id)?.type)){toast(t('cannotDelete'));return}openModal(`<h2 id="modal-title">${t('deleteTitle')}</h2><p>${t('deleteDesc')}</p><div class="actions"><button class="btn" data-action="close-modal">${t('cancel')}</button><button class="btn danger" id="delete-confirm">${t('remove')}</button></div>`);$('#delete-confirm').onclick=async()=>{let next=structuredClone(settings);next[kind]=next[kind].filter(x=>x.id!==id);await commitModal(next)}}
 async function moveItem(kind,id,direction){if(structureLocked())return;let next=structuredClone(settings),i=next[kind].findIndex(x=>x.id===id),j=i+Number(direction);if(i<0||j<0||j>=next[kind].length)return;[next[kind][i],next[kind][j]]=[next[kind][j],next[kind][i]];try{await saveSettings(next)}catch(e){toast(errorMessage(e))}}
+function ballotAdminError(error){
+ if(!error.code || /ROUND_CHANGED|FORBIDDEN/.test(error.message))return errorMessage(error);
+ const vi=lang==='vi';
+ if(error.code==='PGRST202'||error.code==='42P01')return vi?'Thiếu bản cập nhật Supabase. Chạy voting-admin-update.sql trong SQL Editor.':'Apply voting-admin-update.sql in the Supabase SQL Editor.';
+ if(error.code==='21000'||/WHERE clause/i.test(error.message))return vi?'Vui lòng chạy bản voting-admin-update.sql mới nhất trong Supabase.':'Apply the latest voting-admin-update.sql in Supabase.';
+ return 'Supabase ('+error.code+'): '+error.message;
+}
 function manageBallots(id){
  if(!authed||busy)return;
  const vote=id?votes.find(v=>v.id===id):null;
@@ -156,13 +163,13 @@ function manageBallots(id){
    }
    busy=false;closeModal();await reload();toast(t(id?'deletedBallot':'resetDone'));
   }catch(e){
-   busy=false;buttons.forEach(b=>b.disabled=false);$('#edit-error').textContent=errorMessage(e);
+   busy=false;buttons.forEach(b=>b.disabled=false);$('#edit-error').textContent=ballotAdminError(e);
   }
  };
 }
 function viewVote(id){let v=votes.find(v=>v.id===id);if(!v)return;openModal(`<h2 id="modal-title">${t('details')}</h2><p class="muted">${timeFmt(v.created_at)} · UTC+7</p>${settings.questions.map(q=>{let val=v.answers[q.id];if(q.id==='role')val=t(v.role);if(q.id==='project')val=settings.projects.find(p=>p.id===v.project_id)?.name||v.project_id;if(['single','multi'].includes(q.type)){val=(Array.isArray(val)?val:[val]).map(n=>loc(q.options?.[Number(n)])||n).join(', ')}return `<div style="border-top:1px solid var(--line);padding:12px 0"><small>${esc(loc(q.label))}</small><div>${esc(val||'—')}</div></div>`}).join('')}<div class="actions"><button class="btn danger" data-delete-ballot="${esc(v.id)}">${t('deleteBallot')}</button><button class="btn primary" data-action="close-modal">${t('close')}</button></div>`)}
 async function refreshToken(){if(!session?.refresh_token)throw Error('FORBIDDEN');let r=await fetch(CONFIG.supabaseUrl.replace(/\/$/,'')+'/auth/v1/token?grant_type=refresh_token',{method:'POST',headers:{apikey:CONFIG.supabaseKey,'Content-Type':'application/json'},body:JSON.stringify({refresh_token:session.refresh_token})});if(!r.ok)throw Error('FORBIDDEN');session=await r.json();sessionStorage.setItem(KEY+'-auth',JSON.stringify(session))}
-async function api(path,options={},admin=false,retry=true){let h={apikey:CONFIG.supabaseKey,'Content-Type':'application/json'};if(admin){if(!session?.access_token)throw Error('FORBIDDEN');h.Authorization='Bearer '+session.access_token}let r=await fetch(CONFIG.supabaseUrl.replace(/\/$/,'')+path,{...options,headers:{...h,...options.headers},body:options.body?JSON.stringify(options.body):undefined});if(r.status===401&&admin&&retry){await refreshToken();return api(path,options,admin,false)}let data=await r.json().catch(()=>null);if(!r.ok)throw Error(data?.message||data?.error_description||'NETWORK');return data}
+async function api(path,options={},admin=false,retry=true){let h={apikey:CONFIG.supabaseKey,'Content-Type':'application/json'};if(admin){if(!session?.access_token)throw Error('FORBIDDEN');h.Authorization='Bearer '+session.access_token}let r=await fetch(CONFIG.supabaseUrl.replace(/\/$/,'')+path,{...options,headers:{...h,...options.headers},body:options.body?JSON.stringify(options.body):undefined});if(r.status===401&&admin&&retry){await refreshToken();return api(path,options,admin,false)}let data=await r.json().catch(()=>null);if(!r.ok){const err=Error(data?.message||data?.error_description||r.statusText);err.code=data?.code||String(r.status);throw err}return data}
 async function loadPublic(){settings=await api('/rest/v1/rpc/dd_public_config',{method:'POST',body:{}},false);if(!settings?.projects||!settings?.questions)throw Error('INVALID_CONFIG')}
 async function loadVotes(){votes=await api('/rest/v1/dd_votes?select=*&order=created_at.desc&limit=10000',{},true)}
 async function authenticate(email,password){let r=await fetch(CONFIG.supabaseUrl.replace(/\/$/,'')+'/auth/v1/token?grant_type=password',{method:'POST',headers:{apikey:CONFIG.supabaseKey,'Content-Type':'application/json'},body:JSON.stringify({email,password})});if(!r.ok)throw Error('FORBIDDEN');session=await r.json();sessionStorage.setItem(KEY+'-auth',JSON.stringify(session));let ok=await api('/rest/v1/rpc/dd_is_admin',{method:'POST',body:{}},true);if(!ok)throw Error('FORBIDDEN');await loadVotes();authed=true;render()}
@@ -375,8 +382,8 @@ begin
  if not public.dd_is_admin() then raise exception 'FORBIDDEN'; end if;
  select data into strict cfg from public.dd_settings where id for update;
  if p_round is distinct from coalesce(cfg->>'round_id','initial') then raise exception 'ROUND_CHANGED'; end if;
- delete from public.dd_votes;
- delete from public.dd_void_browsers;
+ delete from public.dd_votes where id is not null;
+ delete from public.dd_void_browsers where browser_id is not null;
  update public.dd_settings set data=cfg||jsonb_build_object('round_id',gen_random_uuid()::text,'status','waiting') where id;
 end; $$;
 revoke all on function public.dd_delete_ballot(uuid,text),public.dd_reset_voting(text) from public,anon;
